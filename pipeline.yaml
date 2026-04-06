@@ -1,0 +1,26 @@
+version: 1
+
+prompts_dir: prompts/
+state_dir: logs/
+reports_dir: reports/
+
+repos:
+  claude-context-proxy: .
+
+shared_context:
+  - .
+
+defaults:
+  model: sonnet
+  budget_usd: 1.50
+  max_turns: 100
+  claude_cmd: claude-personal
+
+max_parallel: 2
+total_budget_usd: 20.00
+warn_at_pct: 80
+
+hooks:
+  on_fail: ""
+  on_done: ""
+  on_all_done: ""

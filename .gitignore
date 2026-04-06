@@ -1,0 +1,3 @@
+.cache/
+*.jsonl
+session.json
