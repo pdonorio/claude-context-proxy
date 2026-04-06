@@ -1,0 +1,17 @@
+Phase 2 is complete. Here's what was built:
+
+**Structs extended** (`main.go:27-41`):
+- `Session.SessionID` — set to Unix timestamp string on new session creation
+- `HistoryEntry.SessionID` — written on every history append; `omitempty` for backwards-compat
+
+**New subcommands**:
+- `claude-context-proxy sessions` — groups history by session_id, prints one row per session sorted newest-first with cost
+- `claude-context-proxy history [--today|--since=DATE|--session=ID|--last]` — filtered per-request log, defaults to `--last`
+
+**`stats` updated**: Added `Total cost: ~$X.XX` line.
+
+**New tests** (all 10 pass):
+- `TestSessionID` — verifies same-session entries share ID; gap resets session
+- `TestSessionsCmd` — known history grouped correctly  
+- `TestHistoryFilter` — `--today`, `--since`, `--last`, `--session` filters all verified
+- `TestOldHistoryNoSessionID` — old entries without `session_id` parse without panic, shown as `(unknown)`

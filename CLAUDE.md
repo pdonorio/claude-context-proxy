@@ -29,5 +29,9 @@ pp status     # show all prompts
 - Phase 3 (002): statusline integration (fish + .files/states/ctx.json)
 - Phase 4 (003): token breakdown by tool call (nice to have)
 
+## Git
+GPG signing is disabled for this repo (`commit.gpgsign=false` in `.git/config`).
+Do not use `--no-gpg-sign` flag — the config already handles it.
+
 ## Language
 Go — single binary, no deps, fast startup.

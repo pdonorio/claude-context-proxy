@@ -1,6 +1,7 @@
 ---
 id: "000"
 title: "Phase 1 — minimal token-counting proxy"
+phase: "phase-1"
 repo: "claude-context-proxy"
 model: "sonnet"
 depends_on: []
