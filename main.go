@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,7 @@ const (
 
 // Session holds per-session accumulated stats.
 type Session struct {
+	SessionID     string    `json:"session_id"`
 	StartedAt     time.Time `json:"started_at"`
 	Requests      int       `json:"requests"`
 	InputTokens   int64     `json:"input_tokens"`
@@ -34,10 +36,11 @@ type Session struct {
 
 // HistoryEntry is one line in history.jsonl.
 type HistoryEntry struct {
-	TS     time.Time `json:"ts"`
-	Input  int64     `json:"input"`
-	Output int64     `json:"output"`
-	Path   string    `json:"path"`
+	SessionID string    `json:"session_id,omitempty"`
+	TS        time.Time `json:"ts"`
+	Input     int64     `json:"input"`
+	Output    int64     `json:"output"`
+	Path      string    `json:"path"`
 }
 
 var (
@@ -99,7 +102,10 @@ func recordTokens(input, output int64, path string) {
 	gap := time.Duration(sessionGapMinutes) * time.Minute
 
 	if session == nil || (session.LastRequestAt != time.Time{} && now.Sub(session.LastRequestAt) > gap) {
-		session = &Session{StartedAt: now}
+		session = &Session{
+			SessionID: fmt.Sprintf("%d", now.Unix()),
+			StartedAt: now,
+		}
 	}
 
 	session.Requests++
@@ -108,7 +114,7 @@ func recordTokens(input, output int64, path string) {
 	session.LastRequestAt = now
 
 	saveSession(session)
-	appendHistory(HistoryEntry{TS: now, Input: input, Output: output, Path: path})
+	appendHistory(HistoryEntry{SessionID: session.SessionID, TS: now, Input: input, Output: output, Path: path})
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +208,7 @@ func cmdStats() {
 	fmt.Printf("Requests:       %s\n", fmtInt(s.Requests))
 	fmt.Printf("Input tokens:   %s  (~$%.2f)\n", fmtInt64(s.InputTokens), inputCost)
 	fmt.Printf("Output tokens:  %s  (~$%.2f)\n", fmtInt64(s.OutputTokens), outputCost)
+	fmt.Printf("Total cost:     ~$%.2f\n", inputCost+outputCost)
 	fmt.Println(sep)
 
 	// Top input spikes from last 10 history entries.
@@ -243,6 +250,138 @@ func cmdStats() {
 	}
 	if shown == 0 {
 		fmt.Println("  (none)")
+	}
+}
+
+// ── Sessions CLI ───────────────────────────────────────────────────────────
+
+func cmdSessions() {
+	entries := readHistory()
+	if len(entries) == 0 {
+		fmt.Println("No history found.")
+		return
+	}
+
+	type sessionRow struct {
+		id       string
+		startedAt time.Time
+		requests int
+		input    int64
+		output   int64
+	}
+
+	// Group by session_id. Preserve insertion order via a slice of IDs.
+	order := []string{}
+	rows := map[string]*sessionRow{}
+	for _, e := range entries {
+		sid := e.SessionID
+		if sid == "" {
+			sid = "(unknown)"
+		}
+		if _, ok := rows[sid]; !ok {
+			order = append(order, sid)
+			rows[sid] = &sessionRow{id: sid, startedAt: e.TS}
+		}
+		r := rows[sid]
+		r.requests++
+		r.input += e.Input
+		r.output += e.Output
+		if e.TS.Before(r.startedAt) {
+			r.startedAt = e.TS
+		}
+	}
+
+	// Sort newest-first by startedAt.
+	sort.Slice(order, func(i, j int) bool {
+		return rows[order[i]].startedAt.After(rows[order[j]].startedAt)
+	})
+
+	fmt.Printf("%-20s  %-9s  %-12s  %-12s  %s\n", "Session", "Requests", "Input", "Output", "Cost")
+	fmt.Println(strings.Repeat("─", 72))
+	for _, sid := range order {
+		r := rows[sid]
+		cost := float64(r.input)/1_000_000*inputPriceMtok + float64(r.output)/1_000_000*outputPriceMtok
+		label := sid
+		if sid != "(unknown)" {
+			label = r.startedAt.Local().Format("2006-01-02 15:04")
+		}
+		fmt.Printf("%-20s  %-9s  %-12s  %-12s  $%.2f\n",
+			label, fmtInt(r.requests), fmtInt64(r.input), fmtInt64(r.output), cost)
+	}
+}
+
+// ── History CLI ────────────────────────────────────────────────────────────
+
+func cmdHistory(args []string) {
+	fs := flag.NewFlagSet("history", flag.ExitOnError)
+	today := fs.Bool("today", false, "entries from today")
+	since := fs.String("since", "", "entries on or after YYYY-MM-DD")
+	sessionID := fs.String("session", "", "entries for specific session_id")
+	last := fs.Bool("last", false, "entries from the most recent session")
+	fs.Parse(args)
+
+	entries := readHistory()
+	if len(entries) == 0 {
+		fmt.Println("No history found.")
+		return
+	}
+
+	// Determine filter mode. Default to --last if no filter given.
+	noFilter := !*today && *since == "" && *sessionID == "" && !*last
+	if noFilter {
+		*last = true
+	}
+
+	// Find most-recent session ID if needed.
+	lastSID := ""
+	if *last {
+		for i := len(entries) - 1; i >= 0; i-- {
+			if entries[i].SessionID != "" {
+				lastSID = entries[i].SessionID
+				break
+			}
+		}
+	}
+
+	now := time.Now()
+	todayStr := now.Local().Format("2006-01-02")
+
+	var sinceTime time.Time
+	if *since != "" {
+		t, err := time.ParseInLocation("2006-01-02", *since, time.Local)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --since date: %v\n", err)
+			os.Exit(1)
+		}
+		sinceTime = t
+	}
+
+	var filtered []HistoryEntry
+	for _, e := range entries {
+		if *today && e.TS.Local().Format("2006-01-02") != todayStr {
+			continue
+		}
+		if *since != "" && e.TS.Local().Before(sinceTime) {
+			continue
+		}
+		if *sessionID != "" && e.SessionID != *sessionID {
+			continue
+		}
+		if *last && e.SessionID != lastSID {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+
+	// Print newest-first.
+	for i := len(filtered) - 1; i >= 0; i-- {
+		e := filtered[i]
+		fmt.Printf("%s  input=%s  output=%s  path=%s\n",
+			e.TS.Local().Format("2006-01-02 15:04"),
+			fmtInt64(e.Input), fmtInt64(e.Output), e.Path)
+	}
+	if len(filtered) == 0 {
+		fmt.Println("No entries match.")
 	}
 }
 
@@ -290,9 +429,18 @@ func main() {
 	}
 
 	// Subcommand dispatch.
-	if len(os.Args) > 1 && os.Args[1] == "stats" {
-		cmdStats()
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "stats":
+			cmdStats()
+			return
+		case "sessions":
+			cmdSessions()
+			return
+		case "history":
+			cmdHistory(os.Args[2:])
+			return
+		}
 	}
 
 	// Load existing session from disk so we survive restarts within gap.

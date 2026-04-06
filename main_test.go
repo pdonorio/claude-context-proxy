@@ -349,6 +349,227 @@ func buildTestProxyHandler(targetURL string) http.Handler {
 	})
 }
 
+// ── Phase 2 tests ──────────────────────────────────────────────────────────
+
+// TestSessionID verifies two requests in the same session share an ID,
+// and a request after a gap gets a new session ID.
+func TestSessionID(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	savedGap := sessionGapMinutes
+	sessionGapMinutes = 1
+	defer func() { sessionGapMinutes = savedGap }()
+
+	recordTokens(100, 10, "/v1/messages")
+	recordTokens(200, 20, "/v1/messages")
+	time.Sleep(20 * time.Millisecond)
+
+	hist := readHistory()
+	if len(hist) != 2 {
+		t.Fatalf("expected 2 history entries, got %d", len(hist))
+	}
+	if hist[0].SessionID == "" {
+		t.Error("first entry has empty session_id")
+	}
+	if hist[0].SessionID != hist[1].SessionID {
+		t.Errorf("same-session entries have different IDs: %q vs %q", hist[0].SessionID, hist[1].SessionID)
+	}
+	firstSID := hist[0].SessionID
+
+	// Simulate gap: set LastRequestAt to 2 minutes ago and force a new session by
+	// clearing in-memory session (mirroring what happens after real gap).
+	mu.Lock()
+	session = nil
+	// Write a stale session to disk so loadSession reads it but detects gap.
+	stale := &Session{
+		SessionID:     firstSID,
+		StartedAt:     time.Now().UTC().Add(-10 * time.Minute),
+		Requests:      2,
+		InputTokens:   300,
+		OutputTokens:  30,
+		LastRequestAt: time.Now().UTC().Add(-2 * time.Minute),
+	}
+	mu.Unlock()
+	saveSession(stale)
+
+	recordTokens(50, 5, "/v1/messages")
+	time.Sleep(20 * time.Millisecond)
+
+	hist2 := readHistory()
+	if len(hist2) != 3 {
+		t.Fatalf("expected 3 history entries, got %d", len(hist2))
+	}
+	// Post-gap entry should be in a new session (Requests reset to 1).
+	if hist2[2].SessionID == "" {
+		t.Error("post-gap entry has empty session_id")
+	}
+	// Verify the in-memory session was reset (only 1 request).
+	mu.Lock()
+	curSession := session
+	mu.Unlock()
+	if curSession == nil {
+		t.Fatal("in-memory session is nil after recordTokens")
+	}
+	if curSession.Requests != 1 {
+		t.Errorf("post-gap session should have Requests=1, got %d", curSession.Requests)
+	}
+	// Note: session IDs are Unix-second timestamps, so they may match if test
+	// runs within the same second — we verify reset behavior via Requests count.
+}
+
+// TestSessionsCmd verifies sessions subcommand groups history correctly.
+func TestSessionsCmd(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	entries := []HistoryEntry{
+		{SessionID: "1000", TS: now.Add(-2 * time.Hour), Input: 10000, Output: 500, Path: "/v1/messages"},
+		{SessionID: "1000", TS: now.Add(-90 * time.Minute), Input: 20000, Output: 1000, Path: "/v1/messages"},
+		{SessionID: "2000", TS: now.Add(-30 * time.Minute), Input: 50000, Output: 2000, Path: "/v1/messages"},
+	}
+	f, _ := os.OpenFile(historyFile(), os.O_CREATE|os.O_WRONLY, 0o644)
+	for _, e := range entries {
+		line, _ := json.Marshal(e)
+		f.Write(append(line, '\n'))
+	}
+	f.Close()
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdSessions()
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := string(out)
+
+	// Should have 2 session rows.
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	// header + separator + 2 session rows = 4 lines
+	if len(lines) < 4 {
+		t.Errorf("expected at least 4 lines, got %d:\n%s", len(lines), output)
+	}
+	if !strings.Contains(output, "30,000") {
+		t.Errorf("expected combined input 30,000 for session 1000:\n%s", output)
+	}
+	if !strings.Contains(output, "50,000") {
+		t.Errorf("expected input 50,000 for session 2000:\n%s", output)
+	}
+}
+
+// TestHistoryFilter verifies --today, --since, --last, and --session filters.
+func TestHistoryFilter(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	yesterday := now.Add(-24 * time.Hour)
+	entries := []HistoryEntry{
+		{SessionID: "old", TS: yesterday, Input: 1000, Output: 100, Path: "/v1/messages"},
+		{SessionID: "new", TS: now.Add(-10 * time.Minute), Input: 2000, Output: 200, Path: "/v1/messages"},
+		{SessionID: "new", TS: now.Add(-5 * time.Minute), Input: 3000, Output: 300, Path: "/v1/messages"},
+	}
+	f, _ := os.OpenFile(historyFile(), os.O_CREATE|os.O_WRONLY, 0o644)
+	for _, e := range entries {
+		line, _ := json.Marshal(e)
+		f.Write(append(line, '\n'))
+	}
+	f.Close()
+
+	captureHistory := func(args []string) string {
+		old := os.Stdout
+		r, w, _ := os.Pipe()
+		os.Stdout = w
+		cmdHistory(args)
+		w.Close()
+		os.Stdout = old
+		out, _ := io.ReadAll(r)
+		return string(out)
+	}
+
+	// --last should show only "new" session (2 entries).
+	lastOut := captureHistory([]string{"--last"})
+	if strings.Contains(lastOut, "1,000") {
+		t.Errorf("--last should not include old session entry:\n%s", lastOut)
+	}
+	if !strings.Contains(lastOut, "2,000") || !strings.Contains(lastOut, "3,000") {
+		t.Errorf("--last missing new session entries:\n%s", lastOut)
+	}
+
+	// --today should include today's entries only.
+	todayOut := captureHistory([]string{"--today"})
+	if strings.Contains(todayOut, "1,000") {
+		t.Errorf("--today should not include yesterday entry:\n%s", todayOut)
+	}
+
+	// --session=old should show only old entry.
+	sessionOut := captureHistory([]string{"--session=old"})
+	if !strings.Contains(sessionOut, "1,000") {
+		t.Errorf("--session=old missing old entry:\n%s", sessionOut)
+	}
+	if strings.Contains(sessionOut, "2,000") {
+		t.Errorf("--session=old should not include new session:\n%s", sessionOut)
+	}
+
+	// --since=today should include today entries.
+	todayDate := now.Local().Format("2006-01-02")
+	sinceOut := captureHistory([]string{"--since=" + todayDate})
+	if strings.Contains(sinceOut, "1,000") {
+		t.Errorf("--since=today should not include yesterday:\n%s", sinceOut)
+	}
+
+	// No flags defaults to --last.
+	defaultOut := captureHistory([]string{})
+	if defaultOut != lastOut {
+		t.Errorf("default (no flags) should equal --last output")
+	}
+}
+
+// TestOldHistoryNoSessionID verifies that old entries without session_id parse fine.
+func TestOldHistoryNoSessionID(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write old-format entries without session_id field.
+	lines := `{"ts":"2026-04-05T10:00:00Z","input":1000,"output":100,"path":"/v1/messages"}
+{"ts":"2026-04-05T10:05:00Z","input":2000,"output":200,"path":"/v1/messages"}
+`
+	os.WriteFile(historyFile(), []byte(lines), 0o644)
+
+	hist := readHistory()
+	if len(hist) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(hist))
+	}
+	if hist[0].SessionID != "" {
+		t.Errorf("old entry should have empty session_id, got %q", hist[0].SessionID)
+	}
+	// Should not panic; cmdSessions should handle empty IDs gracefully.
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdSessions()
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	if !strings.Contains(string(out), "(unknown)") {
+		t.Errorf("expected (unknown) for entries without session_id:\n%s", string(out))
+	}
+}
+
 // ── session gap test ───────────────────────────────────────────────────────
 
 func TestSessionGapReset(t *testing.T) {
