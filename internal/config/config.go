@@ -23,6 +23,8 @@ type Config struct {
 	Inspect           bool                  `json:"inspect"`
 	Pricing           map[string]ModelPrice `json:"pricing"`
 	DefaultModel      string                `json:"default_model"`
+	Mode              string                `json:"mode"`
+	ContextWindows    map[string]int64      `json:"context_windows"`
 }
 
 // Default returns the built-in defaults.
@@ -38,7 +40,24 @@ func Default() *Config {
 			"claude-opus-4":   {InputPerMtok: 15.00, OutputPerMtok: 75.00},
 		},
 		DefaultModel: "claude-sonnet-4",
+		Mode:         "context",
+		ContextWindows: map[string]int64{
+			"claude-sonnet-4": 200000,
+			"claude-haiku-4":  200000,
+			"claude-opus-4":   200000,
+		},
 	}
+}
+
+// ContextWindow returns the context window size for the given model.
+// Falls back to 200000 if the model is not found.
+func (c *Config) ContextWindow(model string) int64 {
+	if c.ContextWindows != nil {
+		if w, ok := c.ContextWindows[model]; ok {
+			return w
+		}
+	}
+	return 200000
 }
 
 // Dir returns the config directory path.
@@ -94,6 +113,12 @@ func Load() *Config {
 			if fileCfg.DefaultModel != "" {
 				cfg.DefaultModel = fileCfg.DefaultModel
 			}
+			if fileCfg.Mode != "" {
+				cfg.Mode = fileCfg.Mode
+			}
+			if len(fileCfg.ContextWindows) > 0 {
+				cfg.ContextWindows = fileCfg.ContextWindows
+			}
 		}
 	}
 
@@ -113,6 +138,9 @@ func Load() *Config {
 	}
 	if os.Getenv("CTX_INSPECT") == "1" {
 		cfg.Inspect = true
+	}
+	if v := os.Getenv("CTX_MODE"); v == "context" || v == "cost" {
+		cfg.Mode = v
 	}
 
 	return cfg

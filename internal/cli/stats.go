@@ -34,17 +34,10 @@ func CmdStats(args []string, cfg *config.Config) {
 		durStr = fmt.Sprintf("%dh%dm", hours, minutes%60)
 	}
 
-	inputCost := stats.CostUSD(cfg, cfg.DefaultModel, s.InputTokens, 0)
-	outputCost := stats.CostUSD(cfg, cfg.DefaultModel, 0, s.OutputTokens)
-
 	sep := "─────────────────────────────────────"
 	fmt.Printf("Session: %s (%s)\n", s.StartedAt.Local().Format("2006-01-02 15:04"), durStr)
 	fmt.Println(sep)
 	fmt.Printf("Requests:       %s\n", FmtInt(s.Requests))
-	fmt.Printf("Input tokens:   %s  (~$%.2f)\n", FmtInt64(s.InputTokens), inputCost)
-	fmt.Printf("Output tokens:  %s  (~$%.2f)\n", FmtInt64(s.OutputTokens), outputCost)
-	fmt.Printf("Total cost:     ~$%.2f\n", inputCost+outputCost)
-	fmt.Println(sep)
 
 	entries := stats.ReadHistory()
 	n := len(entries)
@@ -53,36 +46,87 @@ func CmdStats(args []string, cfg *config.Config) {
 		start = 0
 	}
 	recent := entries[start:]
-	if len(recent) == 0 {
-		return
-	}
 
-	type indexed struct {
-		idx   int
-		entry stats.HistoryEntry
-	}
-	indexed2 := make([]indexed, len(recent))
-	for i, e := range recent {
-		indexed2[i] = indexed{start + i + 1, e}
-	}
-	sort.Slice(indexed2, func(i, j int) bool {
-		return indexed2[i].entry.Input > indexed2[j].entry.Input
-	})
+	if cfg.Mode == "cost" {
+		inputCost := stats.CostUSD(cfg, cfg.DefaultModel, s.InputTokens, 0)
+		outputCost := stats.CostUSD(cfg, cfg.DefaultModel, 0, s.OutputTokens)
+		fmt.Printf("Input tokens:   %s  (~$%.2f)\n", FmtInt64(s.InputTokens), inputCost)
+		fmt.Printf("Output tokens:  %s  (~$%.2f)\n", FmtInt64(s.OutputTokens), outputCost)
+		fmt.Printf("Total cost:     ~$%.2f\n", inputCost+outputCost)
+		fmt.Println(sep)
 
-	fmt.Println("Top input spikes (last 10 req):")
-	shown := 0
-	for _, x := range indexed2 {
-		if x.entry.Input == 0 {
-			continue
+		if len(recent) == 0 {
+			return
 		}
-		fmt.Printf("  req #%-4d %s tokens\n", x.idx, FmtInt64(x.entry.Input))
-		shown++
-		if shown >= 5 {
-			break
+		type indexed struct {
+			idx   int
+			entry stats.HistoryEntry
 		}
-	}
-	if shown == 0 {
-		fmt.Println("  (none)")
+		indexed2 := make([]indexed, len(recent))
+		for i, e := range recent {
+			indexed2[i] = indexed{start + i + 1, e}
+		}
+		sort.Slice(indexed2, func(i, j int) bool {
+			return indexed2[i].entry.Input > indexed2[j].entry.Input
+		})
+		fmt.Println("Top input spikes (last 10 req):")
+		shown := 0
+		for _, x := range indexed2 {
+			if x.entry.Input == 0 {
+				continue
+			}
+			fmt.Printf("  req #%-4d %s tokens\n", x.idx, FmtInt64(x.entry.Input))
+			shown++
+			if shown >= 5 {
+				break
+			}
+		}
+		if shown == 0 {
+			fmt.Println("  (none)")
+		}
+	} else {
+		// context mode
+		windowSize := cfg.ContextWindow(cfg.DefaultModel)
+		windows := FmtWindows(s.InputTokens, windowSize)
+		fmt.Printf("Input tokens:   %s  (%s windows)\n", FmtInt64(s.InputTokens), windows)
+		fmt.Printf("Output tokens:  %s\n", FmtInt64(s.OutputTokens))
+		ratio := "N/A"
+		if s.OutputTokens > 0 {
+			ratio = fmt.Sprintf("%.1f:1", float64(s.InputTokens)/float64(s.OutputTokens))
+		}
+		fmt.Printf("Context ratio:  %s  (in:out)\n", ratio)
+		fmt.Println(sep)
+
+		if len(recent) == 0 {
+			return
+		}
+		type indexed struct {
+			idx   int
+			entry stats.HistoryEntry
+		}
+		indexed2 := make([]indexed, len(recent))
+		for i, e := range recent {
+			indexed2[i] = indexed{start + i + 1, e}
+		}
+		sort.Slice(indexed2, func(i, j int) bool {
+			return indexed2[i].entry.Input > indexed2[j].entry.Input
+		})
+		fmt.Println("Top context spikes (last 10 req):")
+		shown := 0
+		for _, x := range indexed2 {
+			if x.entry.Input == 0 {
+				continue
+			}
+			pct := FmtWindowPct(x.entry.Input, windowSize)
+			fmt.Printf("  req #%-4d %s tokens  (%s of window)\n", x.idx, FmtInt64(x.entry.Input), pct)
+			shown++
+			if shown >= 5 {
+				break
+			}
+		}
+		if shown == 0 {
+			fmt.Println("  (none)")
+		}
 	}
 
 	if *showTools {
@@ -304,11 +348,30 @@ func CmdStatusline(args []string, cfg *config.Config) {
 		}
 	}
 
-	fmt.Printf("⬡ %s in · %s out · $%.2f%s\n",
-		FmtCompact(state.InputTokens),
-		FmtCompact(state.OutputTokens),
-		state.CostUSD,
-		toolSuffix)
+	if cfg.Mode == "cost" {
+		fmt.Printf("⬡ %s in · %s out · $%.2f%s\n",
+			FmtCompact(state.InputTokens),
+			FmtCompact(state.OutputTokens),
+			state.CostUSD,
+			toolSuffix)
+	} else {
+		windowSize := cfg.ContextWindow(cfg.DefaultModel)
+		ratio := "N/A"
+		if state.OutputTokens > 0 {
+			ratio = fmt.Sprintf("%.1f:1", float64(state.InputTokens)/float64(state.OutputTokens))
+		}
+		// Format windows with 'w' suffix for compact display.
+		winVal := float64(state.InputTokens) / float64(windowSize)
+		if winVal < 0.1 {
+			winVal = 0.1
+		}
+		wStr := fmt.Sprintf("%.1fw", winVal)
+		fmt.Printf("⬡ %s in · %s · %s%s\n",
+			FmtCompact(state.InputTokens),
+			wStr,
+			ratio,
+			toolSuffix)
+	}
 }
 
 // CmdConfig implements the "config" subcommand.
@@ -346,6 +409,28 @@ func FmtInt64(n int64) string {
 
 // FmtInt formats n with comma separators.
 func FmtInt(n int) string { return FmtInt64(int64(n)) }
+
+// FmtWindows formats cumulative tokens as "N.N×" context windows consumed.
+// Minimum display value is "0.1×".
+func FmtWindows(tokens, windowSize int64) string {
+	if windowSize <= 0 {
+		windowSize = 200000
+	}
+	ratio := float64(tokens) / float64(windowSize)
+	if ratio < 0.1 {
+		ratio = 0.1
+	}
+	return fmt.Sprintf("%.1f×", ratio)
+}
+
+// FmtWindowPct formats tokens as a percentage of the window size.
+func FmtWindowPct(tokens, windowSize int64) string {
+	if windowSize <= 0 {
+		windowSize = 200000
+	}
+	pct := int(float64(tokens) / float64(windowSize) * 100)
+	return fmt.Sprintf("%d%%", pct)
+}
 
 // FmtCompact formats n as a compact string (e.g. 1k, 1M).
 func FmtCompact(n int64) string {
