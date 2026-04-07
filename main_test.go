@@ -218,10 +218,11 @@ func TestSessionJSONWritten(t *testing.T) {
 	}
 }
 
-// TestStatsOutput verifies the stats subcommand produces correct output.
+// TestStatsOutput verifies the stats subcommand produces correct output (cost mode).
 func TestStatsOutput(t *testing.T) {
 	cleanup := withTempCache(t)
 	defer cleanup()
+	cfg.Mode = "cost"
 
 	// Write a known history.
 	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
@@ -653,7 +654,7 @@ func TestStatuslineAtomic(t *testing.T) {
 	}
 }
 
-// TestStatuslineCmd verifies the compact output format.
+// TestStatuslineCmd verifies the compact output format (cost mode).
 func TestStatuslineCmd(t *testing.T) {
 	cleanup := withTempCache(t)
 	defer cleanup()
@@ -661,7 +662,9 @@ func TestStatuslineCmd(t *testing.T) {
 	tmp := t.TempDir()
 	statePath := filepath.Join(tmp, "ctx.json")
 	os.Setenv("CTX_STATUSLINE_PATH", statePath)
+	os.Setenv("CTX_MODE", "cost")
 	defer os.Unsetenv("CTX_STATUSLINE_PATH")
+	defer os.Unsetenv("CTX_MODE")
 	cfg = loadConfig() // Reload to pick up env var
 
 	state := StatuslineState{
@@ -1197,5 +1200,198 @@ func TestHistoryHasModel(t *testing.T) {
 	}
 	if hist[1].Model != "claude-haiku-4" {
 		t.Errorf("history[1].Model = %q, want claude-haiku-4", hist[1].Model)
+	}
+}
+
+// ── Phase 7 tests ──────────────────────────────────────────────────────────
+
+// TestContextModeStats verifies stats output in context mode: shows × and %, no $.
+func TestContextModeStats(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+	cfg.Mode = "context"
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	s := Session{
+		StartedAt:     now.Add(-47 * time.Minute),
+		Requests:      38,
+		InputTokens:   284391,
+		OutputTokens:  18204,
+		LastRequestAt: now,
+	}
+	data, _ := json.MarshalIndent(s, "", "  ")
+	os.WriteFile(sessionFile(), data, 0o644)
+
+	entries := []HistoryEntry{
+		{TS: now.Add(-10 * time.Minute), Input: 82341, Output: 500, Path: "/v1/messages"},
+		{TS: now.Add(-5 * time.Minute), Input: 61204, Output: 800, Path: "/v1/messages"},
+		{TS: now, Input: 140846, Output: 16904, Path: "/v1/messages"},
+	}
+	f, _ := os.OpenFile(historyFile(), os.O_CREATE|os.O_WRONLY, 0o644)
+	for _, e := range entries {
+		line, _ := json.Marshal(e)
+		f.Write(append(line, '\n'))
+	}
+	f.Close()
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdStats([]string{})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := string(out)
+
+	// Must contain window and ratio markers.
+	if !strings.Contains(output, "×") {
+		t.Errorf("context mode missing ×: %q", output)
+	}
+	if !strings.Contains(output, "%") {
+		t.Errorf("context mode missing %%: %q", output)
+	}
+	if !strings.Contains(output, "Context ratio") {
+		t.Errorf("context mode missing 'Context ratio': %q", output)
+	}
+	// Must NOT contain dollar amounts.
+	if strings.Contains(output, "$") {
+		t.Errorf("context mode should not contain $: %q", output)
+	}
+}
+
+// TestCostModeStats verifies stats output in cost mode: shows $, no ×.
+func TestCostModeStats(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+	cfg.Mode = "cost"
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	s := Session{
+		StartedAt:     now.Add(-47 * time.Minute),
+		Requests:      38,
+		InputTokens:   284391,
+		OutputTokens:  18204,
+		LastRequestAt: now,
+	}
+	data, _ := json.MarshalIndent(s, "", "  ")
+	os.WriteFile(sessionFile(), data, 0o644)
+
+	entries := []HistoryEntry{
+		{TS: now.Add(-10 * time.Minute), Input: 82341, Output: 500, Path: "/v1/messages"},
+	}
+	f, _ := os.OpenFile(historyFile(), os.O_CREATE|os.O_WRONLY, 0o644)
+	for _, e := range entries {
+		line, _ := json.Marshal(e)
+		f.Write(append(line, '\n'))
+	}
+	f.Close()
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdStats([]string{})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := string(out)
+
+	if !strings.Contains(output, "$") {
+		t.Errorf("cost mode missing $: %q", output)
+	}
+	if strings.Contains(output, "×") {
+		t.Errorf("cost mode should not contain ×: %q", output)
+	}
+}
+
+// TestContextModeStatusline verifies statusline output in context mode: w and :1, no $.
+func TestContextModeStatusline(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	tmp := t.TempDir()
+	statePath := filepath.Join(tmp, "ctx.json")
+	os.Setenv("CTX_STATUSLINE_PATH", statePath)
+	os.Setenv("CTX_MODE", "context")
+	defer os.Unsetenv("CTX_STATUSLINE_PATH")
+	defer os.Unsetenv("CTX_MODE")
+	cfg = loadConfig()
+
+	state := StatuslineState{
+		InputTokens:  284391,
+		OutputTokens: 18204,
+		Requests:     38,
+		CostUSD:      1.13,
+		SessionID:    "1744048320",
+		UpdatedAt:    time.Now().UTC(),
+	}
+	data, _ := json.Marshal(state)
+	os.WriteFile(statePath, data, 0o644)
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdStatusline([]string{})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := strings.TrimSpace(string(out))
+
+	if !strings.Contains(output, "w") {
+		t.Errorf("context mode statusline missing 'w' suffix: %q", output)
+	}
+	if !strings.Contains(output, ":1") {
+		t.Errorf("context mode statusline missing ':1' ratio: %q", output)
+	}
+	if strings.Contains(output, "$") {
+		t.Errorf("context mode statusline should not contain $: %q", output)
+	}
+}
+
+// TestCostModeStatusline verifies statusline output in cost mode: $, no w suffix.
+func TestCostModeStatusline(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	tmp := t.TempDir()
+	statePath := filepath.Join(tmp, "ctx.json")
+	os.Setenv("CTX_STATUSLINE_PATH", statePath)
+	os.Setenv("CTX_MODE", "cost")
+	defer os.Unsetenv("CTX_STATUSLINE_PATH")
+	defer os.Unsetenv("CTX_MODE")
+	cfg = loadConfig()
+
+	state := StatuslineState{
+		InputTokens:  284391,
+		OutputTokens: 18204,
+		Requests:     38,
+		CostUSD:      1.13,
+		SessionID:    "1744048320",
+		UpdatedAt:    time.Now().UTC(),
+	}
+	data, _ := json.Marshal(state)
+	os.WriteFile(statePath, data, 0o644)
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdStatusline([]string{})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := strings.TrimSpace(string(out))
+
+	if !strings.Contains(output, "$") {
+		t.Errorf("cost mode statusline missing $: %q", output)
+	}
+	if strings.Contains(output, ":1") {
+		t.Errorf("cost mode statusline should not contain :1 ratio: %q", output)
 	}
 }
