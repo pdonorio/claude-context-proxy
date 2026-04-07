@@ -40,12 +40,20 @@ func CmdStats(args []string, cfg *config.Config) {
 	fmt.Printf("Requests:       %s\n", FmtInt(s.Requests))
 
 	entries := stats.ReadHistory()
-	n := len(entries)
-	start := n - 10
-	if start < 0 {
-		start = 0
+
+	// Filter to current session only, then take last 10.
+	var sessionEntries []stats.HistoryEntry
+	for _, e := range entries {
+		if e.SessionID == s.SessionID {
+			sessionEntries = append(sessionEntries, e)
+		}
 	}
-	recent := entries[start:]
+	recent := sessionEntries
+	if len(recent) > 10 {
+		recent = recent[len(recent)-10:]
+	}
+	// reqOffset is the 1-based index of the first entry in recent within the session.
+	reqOffset := len(sessionEntries) - len(recent)
 
 	if cfg.Mode == "cost" {
 		inputCost := stats.CostUSD(cfg, cfg.DefaultModel, s.InputTokens, 0)
@@ -64,7 +72,7 @@ func CmdStats(args []string, cfg *config.Config) {
 		}
 		indexed2 := make([]indexed, len(recent))
 		for i, e := range recent {
-			indexed2[i] = indexed{start + i + 1, e}
+			indexed2[i] = indexed{reqOffset + i + 1, e}
 		}
 		sort.Slice(indexed2, func(i, j int) bool {
 			return indexed2[i].entry.Input > indexed2[j].entry.Input
@@ -106,7 +114,7 @@ func CmdStats(args []string, cfg *config.Config) {
 		}
 		indexed2 := make([]indexed, len(recent))
 		for i, e := range recent {
-			indexed2[i] = indexed{start + i + 1, e}
+			indexed2[i] = indexed{reqOffset + i + 1, e}
 		}
 		sort.Slice(indexed2, func(i, j int) bool {
 			return indexed2[i].entry.Input > indexed2[j].entry.Input

@@ -279,6 +279,126 @@ func TestStatsOutput(t *testing.T) {
 	}
 }
 
+// TestStatsOnlyShowsCurrentSession verifies that top-spikes in stats are
+// filtered to the current session — not drawn from all history.
+func TestStatsOnlyShowsCurrentSession(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	currentSID := "sess-current"
+	oldSID := "sess-old"
+
+	// session.json points to the current session (2 requests, small tokens).
+	s := Session{
+		SessionID:     currentSID,
+		StartedAt:     now.Add(-5 * time.Minute),
+		Requests:      2,
+		InputTokens:   1000,
+		OutputTokens:  50,
+		LastRequestAt: now,
+	}
+	data, _ := json.MarshalIndent(s, "", "  ")
+	os.WriteFile(sessionFile(), data, 0o644)
+
+	// History has two old entries with huge token counts and two current entries.
+	entries := []HistoryEntry{
+		{SessionID: oldSID, TS: now.Add(-2 * time.Hour), Input: 999999, Output: 500, Path: "/v1/messages"},
+		{SessionID: oldSID, TS: now.Add(-1 * time.Hour), Input: 888888, Output: 400, Path: "/v1/messages"},
+		{SessionID: currentSID, TS: now.Add(-3 * time.Minute), Input: 600, Output: 30, Path: "/v1/messages"},
+		{SessionID: currentSID, TS: now.Add(-1 * time.Minute), Input: 400, Output: 20, Path: "/v1/messages"},
+	}
+	f, _ := os.OpenFile(historyFile(), os.O_CREATE|os.O_WRONLY, 0o644)
+	for _, e := range entries {
+		line, _ := json.Marshal(e)
+		f.Write(append(line, '\n'))
+	}
+	f.Close()
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdStats([]string{})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := string(out)
+
+	// Old session's huge numbers must NOT appear in spikes.
+	if strings.Contains(output, "999,999") || strings.Contains(output, "888,888") {
+		t.Errorf("stats spikes must not include entries from old session:\n%s", output)
+	}
+	// Current session entries should appear.
+	if !strings.Contains(output, "600") {
+		t.Errorf("stats spikes missing current session entry (600):\n%s", output)
+	}
+}
+
+// TestStatsReqNumbersArePerSession verifies that req numbers in spikes are
+// 1-based within the current session, not global history offsets.
+func TestStatsReqNumbersArePerSession(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	currentSID := "sess-now"
+
+	s := Session{
+		SessionID:     currentSID,
+		StartedAt:     now.Add(-10 * time.Minute),
+		Requests:      2,
+		InputTokens:   50000,
+		OutputTokens:  200,
+		LastRequestAt: now,
+	}
+	data, _ := json.MarshalIndent(s, "", "  ")
+	os.WriteFile(sessionFile(), data, 0o644)
+
+	// 6 old entries from a different session, then 2 from current.
+	// Without the fix, req numbers would be #7 and #8 instead of #1 and #2.
+	entries := []HistoryEntry{
+		{SessionID: "old", TS: now.Add(-6 * time.Hour), Input: 100, Output: 10, Path: "/v1/messages"},
+		{SessionID: "old", TS: now.Add(-5 * time.Hour), Input: 100, Output: 10, Path: "/v1/messages"},
+		{SessionID: "old", TS: now.Add(-4 * time.Hour), Input: 100, Output: 10, Path: "/v1/messages"},
+		{SessionID: "old", TS: now.Add(-3 * time.Hour), Input: 100, Output: 10, Path: "/v1/messages"},
+		{SessionID: "old", TS: now.Add(-2 * time.Hour), Input: 100, Output: 10, Path: "/v1/messages"},
+		{SessionID: "old", TS: now.Add(-1 * time.Hour), Input: 100, Output: 10, Path: "/v1/messages"},
+		{SessionID: currentSID, TS: now.Add(-5 * time.Minute), Input: 30000, Output: 150, Path: "/v1/messages"},
+		{SessionID: currentSID, TS: now.Add(-1 * time.Minute), Input: 20000, Output: 50, Path: "/v1/messages"},
+	}
+	f, _ := os.OpenFile(historyFile(), os.O_CREATE|os.O_WRONLY, 0o644)
+	for _, e := range entries {
+		line, _ := json.Marshal(e)
+		f.Write(append(line, '\n'))
+	}
+	f.Close()
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdStats([]string{})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := string(out)
+
+	// Req numbers must be #1 and #2, not #7 and #8.
+	if strings.Contains(output, "req #7") || strings.Contains(output, "req #8") {
+		t.Errorf("req numbers should be per-session (1, 2) not global offsets (7, 8):\n%s", output)
+	}
+	if !strings.Contains(output, "req #1") || !strings.Contains(output, "req #2") {
+		t.Errorf("expected req #1 and req #2 in output:\n%s", output)
+	}
+}
+
 // TestFmtInt64 verifies comma formatting.
 func TestFmtInt64(t *testing.T) {
 	cases := []struct {
