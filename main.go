@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -41,6 +42,7 @@ type HistoryEntry struct {
 	Input     int64     `json:"input"`
 	Output    int64     `json:"output"`
 	Path      string    `json:"path"`
+	Tools     []string  `json:"tools,omitempty"`
 }
 
 var (
@@ -48,6 +50,7 @@ var (
 	session *Session
 
 	sessionGapMinutes int64 = 30
+	inspectEnabled    bool
 )
 
 func cacheBase() string {
@@ -151,7 +154,63 @@ func appendHistory(e HistoryEntry) {
 	_, _ = f.Write(append(line, '\n'))
 }
 
-func recordTokens(input, output int64, path string) {
+// ── SSE inspector ──────────────────────────────────────────────────────────
+
+// sseEventData holds the minimal JSON fields needed from SSE events.
+type sseEventData struct {
+	Type         string `json:"type"`
+	ContentBlock struct {
+		Type string `json:"type"`
+		Name string `json:"name"`
+	} `json:"content_block"`
+}
+
+// sseInspector wraps an io.Reader and extracts tool names from SSE events inline.
+// It is only instantiated when CTX_INSPECT=1; zero overhead in the default path.
+type sseInspector struct {
+	r     io.Reader
+	buf   []byte
+	Tools []string
+}
+
+func newSSEInspector(r io.Reader) *sseInspector { return &sseInspector{r: r} }
+
+func (s *sseInspector) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 {
+		s.ingest(p[:n])
+	}
+	return n, err
+}
+
+func (s *sseInspector) ingest(chunk []byte) {
+	s.buf = append(s.buf, chunk...)
+	for {
+		idx := bytes.Index(s.buf, []byte("\n\n"))
+		if idx < 0 {
+			break
+		}
+		s.parseEvent(s.buf[:idx])
+		s.buf = s.buf[idx+2:]
+	}
+}
+
+func (s *sseInspector) parseEvent(raw []byte) {
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data: ")) {
+			continue
+		}
+		var ev sseEventData
+		if json.Unmarshal(line[6:], &ev) != nil {
+			continue
+		}
+		if ev.Type == "content_block_start" && ev.ContentBlock.Type == "tool_use" && ev.ContentBlock.Name != "" {
+			s.Tools = append(s.Tools, ev.ContentBlock.Name)
+		}
+	}
+}
+
+func recordTokens(input, output int64, path string, tools []string) {
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -172,7 +231,7 @@ func recordTokens(input, output int64, path string) {
 
 	saveSession(session)
 	writeStatusline(session)
-	appendHistory(HistoryEntry{SessionID: session.SessionID, TS: now, Input: input, Output: output, Path: path})
+	appendHistory(HistoryEntry{SessionID: session.SessionID, TS: now, Input: input, Output: output, Path: path, Tools: tools})
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -213,11 +272,17 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Stream or buffer depending on content type.
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+	var inspector *sseInspector
 	if isSSE {
+		bodyReader := io.Reader(resp.Body)
+		if inspectEnabled {
+			inspector = newSSEInspector(resp.Body)
+			bodyReader = inspector
+		}
 		flusher, ok := w.(http.Flusher)
 		buf := make([]byte, 4096)
 		for {
-			n, readErr := resp.Body.Read(buf)
+			n, readErr := bodyReader.Read(buf)
 			if n > 0 {
 				_, _ = w.Write(buf[:n])
 				if ok {
@@ -236,13 +301,21 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if inputTokens > 0 || outputTokens > 0 {
-		go recordTokens(inputTokens, outputTokens, r.URL.Path)
+		var tools []string
+		if inspector != nil {
+			tools = inspector.Tools
+		}
+		go recordTokens(inputTokens, outputTokens, r.URL.Path, tools)
 	}
 }
 
 // ── Stats CLI ──────────────────────────────────────────────────────────────
 
-func cmdStats() {
+func cmdStats(args []string) {
+	fs := flag.NewFlagSet("stats", flag.ExitOnError)
+	showTools := fs.Bool("tools", false, "show tool call frequency table")
+	_ = fs.Parse(args)
+
 	s := loadSession()
 	if s == nil {
 		fmt.Println("No session data found. Start the proxy and make some requests.")
@@ -308,6 +381,45 @@ func cmdStats() {
 	}
 	if shown == 0 {
 		fmt.Println("  (none)")
+	}
+
+	if *showTools {
+		fmt.Println(sep)
+		printToolBreakdown(s.SessionID, entries)
+	}
+}
+
+func printToolBreakdown(sessionID string, entries []HistoryEntry) {
+	counts := map[string]int{}
+	for _, e := range entries {
+		if e.SessionID != sessionID {
+			continue
+		}
+		for _, t := range e.Tools {
+			counts[t]++
+		}
+	}
+	fmt.Println("Tool call breakdown (current session):")
+	if len(counts) == 0 {
+		fmt.Println("  (no data — run proxy with CTX_INSPECT=1)")
+		return
+	}
+	type pair struct {
+		name  string
+		count int
+	}
+	pairs := make([]pair, 0, len(counts))
+	for k, v := range counts {
+		pairs = append(pairs, pair{k, v})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].count != pairs[j].count {
+			return pairs[i].count > pairs[j].count
+		}
+		return pairs[i].name < pairs[j].name
+	})
+	for _, p := range pairs {
+		fmt.Printf("  %-10s %d calls\n", p.name, p.count)
 	}
 }
 
@@ -504,10 +616,33 @@ func cmdStatusline(args []string) {
 		return
 	}
 
-	fmt.Printf("⬡ %s in · %s out · $%.2f\n",
+	// Compute most-called tool from history for this session.
+	toolSuffix := ""
+	if entries := readHistory(); len(entries) > 0 {
+		counts := map[string]int{}
+		for _, e := range entries {
+			if e.SessionID == state.SessionID {
+				for _, t := range e.Tools {
+					counts[t]++
+				}
+			}
+		}
+		if len(counts) > 0 {
+			best, bestN := "", 0
+			for t, c := range counts {
+				if c > bestN || (c == bestN && t < best) {
+					best, bestN = t, c
+				}
+			}
+			toolSuffix = fmt.Sprintf(" · %s×%d", best, bestN)
+		}
+	}
+
+	fmt.Printf("⬡ %s in · %s out · $%.2f%s\n",
 		fmtCompact(state.InputTokens),
 		fmtCompact(state.OutputTokens),
-		state.CostUSD)
+		state.CostUSD,
+		toolSuffix)
 }
 
 func fmtInt(n int) string    { return fmtInt64(int64(n)) }
@@ -535,11 +670,14 @@ func main() {
 		}
 	}
 
+	// Enable SSE inspection if requested.
+	inspectEnabled = os.Getenv("CTX_INSPECT") == "1"
+
 	// Subcommand dispatch.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "stats":
-			cmdStats()
+			cmdStats(os.Args[2:])
 			return
 		case "sessions":
 			cmdSessions()

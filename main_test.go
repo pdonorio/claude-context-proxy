@@ -85,7 +85,7 @@ func TestTokenHeaderExtraction(t *testing.T) {
 		io.Copy(w, resp.Body)
 
 		if inputTokens > 0 || outputTokens > 0 {
-			recordTokens(inputTokens, outputTokens, r.URL.Path)
+			recordTokens(inputTokens, outputTokens, r.URL.Path, nil)
 		}
 	})
 
@@ -190,8 +190,8 @@ func TestSessionJSONWritten(t *testing.T) {
 	cleanup := withTempCache(t)
 	defer cleanup()
 
-	recordTokens(1000, 200, "/v1/messages")
-	recordTokens(500, 100, "/v1/messages")
+	recordTokens(1000, 200, "/v1/messages", nil)
+	recordTokens(500, 100, "/v1/messages", nil)
 	time.Sleep(20 * time.Millisecond)
 
 	data, err := os.ReadFile(sessionFile())
@@ -249,7 +249,7 @@ func TestStatsOutput(t *testing.T) {
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 
-	cmdStats()
+	cmdStats([]string{})
 
 	w.Close()
 	os.Stdout = old
@@ -344,7 +344,7 @@ func buildTestProxyHandler(targetURL string) http.Handler {
 		}
 
 		if inputTokens > 0 || outputTokens > 0 {
-			recordTokens(inputTokens, outputTokens, r.URL.Path)
+			recordTokens(inputTokens, outputTokens, r.URL.Path, nil)
 		}
 	})
 }
@@ -361,8 +361,8 @@ func TestSessionID(t *testing.T) {
 	sessionGapMinutes = 1
 	defer func() { sessionGapMinutes = savedGap }()
 
-	recordTokens(100, 10, "/v1/messages")
-	recordTokens(200, 20, "/v1/messages")
+	recordTokens(100, 10, "/v1/messages", nil)
+	recordTokens(200, 20, "/v1/messages", nil)
 	time.Sleep(20 * time.Millisecond)
 
 	hist := readHistory()
@@ -393,7 +393,7 @@ func TestSessionID(t *testing.T) {
 	mu.Unlock()
 	saveSession(stale)
 
-	recordTokens(50, 5, "/v1/messages")
+	recordTokens(50, 5, "/v1/messages", nil)
 	time.Sleep(20 * time.Millisecond)
 
 	hist2 := readHistory()
@@ -582,7 +582,7 @@ func TestStatuslineWrite(t *testing.T) {
 	os.Setenv("CTX_STATUSLINE_PATH", statePath)
 	defer os.Unsetenv("CTX_STATUSLINE_PATH")
 
-	recordTokens(284391, 18204, "/v1/messages")
+	recordTokens(284391, 18204, "/v1/messages", nil)
 	time.Sleep(20 * time.Millisecond)
 
 	data, err := os.ReadFile(statePath)
@@ -624,7 +624,7 @@ func TestStatuslineAtomic(t *testing.T) {
 	os.Setenv("CTX_STATUSLINE_PATH", statePath)
 	defer os.Unsetenv("CTX_STATUSLINE_PATH")
 
-	recordTokens(1000, 100, "/v1/messages")
+	recordTokens(1000, 100, "/v1/messages", nil)
 	time.Sleep(20 * time.Millisecond)
 
 	// No .tmp file should remain.
@@ -726,7 +726,7 @@ func TestStatuslineDisabled(t *testing.T) {
 	defer os.Unsetenv("CTX_STATUSLINE_PATH")
 
 	// Should not panic or write anything.
-	recordTokens(500, 50, "/v1/messages")
+	recordTokens(500, 50, "/v1/messages", nil)
 	time.Sleep(20 * time.Millisecond)
 
 	// Verify statuslinePath returns "".
@@ -820,7 +820,7 @@ func TestSessionGapReset(t *testing.T) {
 	session = nil
 	mu.Unlock()
 
-	recordTokens(100, 10, "/v1/messages")
+	recordTokens(100, 10, "/v1/messages", nil)
 	time.Sleep(20 * time.Millisecond)
 
 	data2, _ := os.ReadFile(sessionFile())
@@ -833,5 +833,186 @@ func TestSessionGapReset(t *testing.T) {
 	}
 	if s2.InputTokens != 100 {
 		t.Errorf("expected InputTokens=100 after reset, got %d", s2.InputTokens)
+	}
+}
+
+// ── Phase 4 tests ──────────────────────────────────────────────────────────
+
+// TestSSETeeParser feeds a real-looking SSE stream through sseInspector and
+// verifies tool names are extracted correctly without modifying byte output.
+func TestSSETeeParser(t *testing.T) {
+	stream := "" +
+		"event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"Read\",\"input\":{}}}\n\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}\n\n" +
+		"event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_02\",\"name\":\"Bash\",\"input\":{}}}\n\n" +
+		"event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":42}}\n\n" +
+		"event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+
+	inspector := newSSEInspector(strings.NewReader(stream))
+
+	// Read all bytes through inspector.
+	got, err := io.ReadAll(inspector)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	// Byte output must be identical.
+	if string(got) != stream {
+		t.Errorf("inspector modified the byte stream\ngot:  %q\nwant: %q", got, stream)
+	}
+
+	// Tool names must be extracted in order.
+	want := []string{"Read", "Bash"}
+	if len(inspector.Tools) != len(want) {
+		t.Fatalf("Tools = %v, want %v", inspector.Tools, want)
+	}
+	for i, name := range want {
+		if inspector.Tools[i] != name {
+			t.Errorf("Tools[%d] = %q, want %q", i, inspector.Tools[i], name)
+		}
+	}
+}
+
+// TestSSETeeParserChunked verifies the inspector works when SSE events are
+// split across multiple Read calls (simulating real network chunking).
+func TestSSETeeParserChunked(t *testing.T) {
+	event := "event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"Glob\",\"input\":{}}}\n\n"
+
+	// Feed the event in 10-byte chunks.
+	inspector := newSSEInspector(strings.NewReader(event))
+	buf := make([]byte, 10)
+	var out []byte
+	for {
+		n, err := inspector.Read(buf)
+		out = append(out, buf[:n]...)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if string(out) != event {
+		t.Errorf("chunked output mismatch")
+	}
+	if len(inspector.Tools) != 1 || inspector.Tools[0] != "Glob" {
+		t.Errorf("Tools = %v, want [Glob]", inspector.Tools)
+	}
+}
+
+// TestHistoryToolField verifies the tools field is written and parsed round-trip.
+func TestHistoryToolField(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	tools := []string{"Read", "Bash", "Read"}
+	recordTokens(1000, 100, "/v1/messages", tools)
+	time.Sleep(20 * time.Millisecond)
+
+	hist := readHistory()
+	if len(hist) != 1 {
+		t.Fatalf("expected 1 history entry, got %d", len(hist))
+	}
+	if len(hist[0].Tools) != len(tools) {
+		t.Fatalf("Tools = %v, want %v", hist[0].Tools, tools)
+	}
+	for i, name := range tools {
+		if hist[0].Tools[i] != name {
+			t.Errorf("Tools[%d] = %q, want %q", i, hist[0].Tools[i], name)
+		}
+	}
+}
+
+// TestHistoryToolFieldNil verifies that nil tools omits the field from JSON.
+func TestHistoryToolFieldNil(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	recordTokens(500, 50, "/v1/messages", nil)
+	time.Sleep(20 * time.Millisecond)
+
+	data, err := os.ReadFile(historyFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"tools"`) {
+		t.Errorf("nil tools should not write tools field; got: %s", data)
+	}
+}
+
+// TestStatsToolsFlag verifies --tools shows the tool frequency table.
+func TestStatsToolsFlag(t *testing.T) {
+	cleanup := withTempCache(t)
+	defer cleanup()
+
+	if err := os.MkdirAll(cacheBase(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	sid := "9999"
+	s := Session{
+		SessionID:     sid,
+		StartedAt:     now.Add(-10 * time.Minute),
+		Requests:      3,
+		InputTokens:   10000,
+		OutputTokens:  1000,
+		LastRequestAt: now,
+	}
+	data, _ := json.MarshalIndent(s, "", "  ")
+	os.WriteFile(sessionFile(), data, 0o644)
+
+	entries := []HistoryEntry{
+		{SessionID: sid, TS: now.Add(-5 * time.Minute), Input: 3000, Output: 300, Path: "/v1/messages",
+			Tools: []string{"Bash", "Read", "Bash"}},
+		{SessionID: sid, TS: now.Add(-3 * time.Minute), Input: 3000, Output: 300, Path: "/v1/messages",
+			Tools: []string{"Read", "Glob", "Bash"}},
+		{SessionID: sid, TS: now, Input: 4000, Output: 400, Path: "/v1/messages",
+			Tools: []string{"Edit"}},
+	}
+	f, _ := os.OpenFile(historyFile(), os.O_CREATE|os.O_WRONLY, 0o644)
+	for _, e := range entries {
+		line, _ := json.Marshal(e)
+		f.Write(append(line, '\n'))
+	}
+	f.Close()
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	cmdStats([]string{"--tools"})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+	output := string(out)
+
+	// Bash appears 3 times, Read 2 times, Glob 1, Edit 1.
+	checks := []string{
+		"Tool call breakdown",
+		"Bash",
+		"Read",
+		"Glob",
+		"Edit",
+		"3 calls",
+		"2 calls",
+	}
+	for _, c := range checks {
+		if !strings.Contains(output, c) {
+			t.Errorf("stats --tools output missing %q\nfull output:\n%s", c, output)
+		}
+	}
+
+	// Bash should appear before Read (higher count).
+	bashIdx := strings.Index(output, "Bash")
+	readIdx := strings.Index(output, "Read")
+	if bashIdx > readIdx {
+		t.Errorf("Bash (3 calls) should appear before Read (2 calls) in output")
 	}
 }
