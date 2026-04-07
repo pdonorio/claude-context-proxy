@@ -286,12 +286,52 @@ func CmdHistory(args []string) {
 
 	for i := len(filtered) - 1; i >= 0; i-- {
 		e := filtered[i]
-		fmt.Printf("%s  input=%s  output=%s  path=%s\n",
+		model := e.Model
+		if model == "" {
+			model = "unknown"
+		}
+		fmt.Printf("%s  input=%-8s  output=%-6s  %s\n",
 			e.TS.Local().Format("2006-01-02 15:04"),
-			FmtInt64(e.Input), FmtInt64(e.Output), e.Path)
+			FmtInt64(e.Input), FmtInt64(e.Output), model)
+		if e.Breakdown != nil {
+			printBreakdown(e.Breakdown, e.Input)
+		}
 	}
 	if len(filtered) == 0 {
 		fmt.Println("No entries match.")
+	}
+}
+
+// printBreakdown renders a tree-style context breakdown under a history entry.
+func printBreakdown(bd *stats.ContextBreakdown, total int64) {
+	if total == 0 {
+		return
+	}
+	type row struct {
+		label  string
+		tokens int64
+	}
+	var rows []row
+	if bd.SystemTokens > 0 {
+		rows = append(rows, row{"system prompt", bd.SystemTokens})
+	}
+	if bd.ToolsTokens > 0 {
+		label := fmt.Sprintf("tools (%d defs)", bd.ToolsCount)
+		rows = append(rows, row{label, bd.ToolsTokens})
+	}
+	if bd.HistoryTokens > 0 {
+		rows = append(rows, row{"conversation", bd.HistoryTokens})
+	}
+	if bd.NewMsgTokens > 0 {
+		rows = append(rows, row{"new message", bd.NewMsgTokens})
+	}
+	for i, r := range rows {
+		pct := int(float64(r.tokens) / float64(total) * 100)
+		connector := "├──"
+		if i == len(rows)-1 {
+			connector = "└──"
+		}
+		fmt.Printf("  %s %-22s %7s  (%d%%)\n", connector, r.label, FmtInt64(r.tokens), pct)
 	}
 }
 

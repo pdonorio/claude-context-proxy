@@ -21,6 +21,7 @@ type Config struct {
 	SessionGapMinutes int64                 `json:"session_gap_minutes"`
 	StatuslinePath    string                `json:"statusline_path"`
 	Inspect           bool                  `json:"inspect"`
+	Debug             bool                  `json:"debug"`
 	Pricing           map[string]ModelPrice `json:"pricing"`
 	DefaultModel      string                `json:"default_model"`
 	Mode              string                `json:"mode"`
@@ -138,6 +139,9 @@ func Load() *Config {
 	}
 	if os.Getenv("CTX_INSPECT") == "1" {
 		cfg.Inspect = true
+	}
+	if os.Getenv("CTX_DEBUG") == "1" {
+		cfg.Debug = true
 	}
 	if v := os.Getenv("CTX_MODE"); v == "context" || v == "cost" {
 		cfg.Mode = v

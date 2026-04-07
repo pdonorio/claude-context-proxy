@@ -125,12 +125,24 @@ claude-context-proxy log
 
 ## Roadmap
 
+### Known bugs
+
+~~1. **Token capture broken after cache-token fix**~~ **Fixed (v0.1.1)** — Changed
+   `if inputTokens == 0 && outputTokens == 0` fallback to always prefer SSE-parsed totals
+   (which include `cache_read_input_tokens` + `cache_creation_input_tokens`) over header
+   counts. Headers only report the tiny raw `input_tokens` value; SSE has the full picture.
+
+~~2. **`ctx:12%` statusline source unknown**~~ **Not a bug** — `ctx:N%` is produced by
+   `~/.claude/statusline-command.sh`, Claude Code's own statusline hook. It reads
+   `.context_window.used_percentage` from Claude Code's native telemetry. Unrelated to the
+   proxy's `statusline` command or `ctx.json`.
+
+~~3. **Stale session after daemon restart**~~ **Fixed by #1** — Was downstream of the token
+   capture bug; `recordTokens` now fires correctly.
+
 ### Near term
-- **Live proxy routing debug** — right now if `ANTHROPIC_BASE_URL` is not set, requests
-  bypass the proxy silently. A `claude-context-proxy status` command could check whether
-  the env var is set in the current shell and whether the proxy is reachable.
-- **`006` retry** — Phase 7 (context mode) completed but needs a clean run confirmation
-  after the limit-reset retry; verify output format end-to-end with real traffic.
+- **Live proxy routing debug** — `claude-context-proxy status` command to check whether
+  proxy is reachable and `HTTPS_PROXY` / `NODE_EXTRA_CA_CERTS` are set in the current shell.
 
 ### Phase 8 — shell integration
 - Fish function that auto-starts the proxy on shell init if not running

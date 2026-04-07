@@ -54,8 +54,9 @@ func BenchmarkProxyHandler(b *testing.B) {
 	}))
 	defer upstream.Close()
 
-	handler := proxy.Handler(upstream.URL, cfg, func(input, output int64, path, model string, tools []string) {
+	handler := proxy.Handler(upstream.URL, cfg, func(ti proxy.TokenInfo) {
 		// no-op: benchmarking proxy overhead, not stats writes
+		_ = ti
 	})
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
@@ -80,7 +81,7 @@ func BenchmarkRecordTokens(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		recordTokens(1000, 100, "/v1/messages", "claude-sonnet-4", nil)
+		recordTokens(1000, 100, "/v1/messages", "claude-sonnet-4", nil, nil)
 	}
 }
 
